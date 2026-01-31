@@ -1,0 +1,22 @@
+<svg width="40" height="40" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Gradient Definition -->
+  <defs>
+    <linearGradient id="logoGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#ff2f92;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#ff78b4;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Chat Bubble 1 -->
+  <path d="M8 12C8 9.79086 9.79086 8 12 8H22C24.2091 8 26 9.79086 26 12V18C26 20.2091 24.2091 22 22 22H16L12 26V22C9.79086 22 8 20.2091 8 18V12Z" 
+        fill="url(#logoGradient)" opacity="0.9"/>
+  
+  <!-- Chat Bubble 2 -->
+  <path d="M14 18C14 15.7909 15.7909 14 18 14H28C30.2091 14 32 15.7909 32 18V24C32 26.2091 30.2091 28 28 28H24L20 32V28C17.7909 28 16 26.2091 16 24V20" 
+        fill="url(#logoGradient)"/>
+  
+  <!-- Voice Wave -->
+  <circle cx="17" cy="15" r="1.5" fill="white" opacity="0.9"/>
+  <circle cx="21" cy="15" r="1.5" fill="white" opacity="0.7"/>
+  <circle cx="24" cy="21" r="1.5" fill="white" opacity="0.9"/>
+</svg>

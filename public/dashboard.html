@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Strango — Dashboard</title>
+  <link rel="stylesheet" href="style.css" />
+  <script defer src="/socket.io/socket.io.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <main id="mainPage" class="app-root">
+    <header class="topbar">
+      <div class="brand">Strango</div>
+      <div class="top-actions">
+        <div id="countryPreview" class="country-preview">🌐</div>
+      </div>
+    </header>
+    <div class="ad-banner">Top Ad — 728×90</div>
+    <div class="container">
+      <aside class="left-panel card filters-card">
+        <h2 class="section-title">Match Filters</h2>
+        <div class="filters">
+          <label>
+            <span>Your Name</span>
+            <input id="displayName" type="text" placeholder="Pick a display name (optional)" maxlength="30" />
+          </label>
+          <label>
+            <span>Country</span>
+            <select id="country">
+              <option value="any">Any</option>
+              <!-- Country options can be copied from index.html -->
+            </select>
+          </label>
+
+          <label>
+            <span>Gender</span>
+            <select id="gender">
+              <option value="any">Any</option>
+              <option value="male">Male</option>
+              <option value="female">Female</option>
+              <option value="trans">Trans</option>
+              <option value="couple">Couple</option>
+            </select>
+          </label>
+        </div>
+        <button id="startBtn" class="btn primary">Start Talking</button>
+        <button id="nextBtn" class="btn secondary" disabled>Next</button>
+        <div id="status" class="status">Not connected</div>
+      </aside>
+      <section class="right-panel card">
+        <div class="connection-row">
+          <div id="connectionBadge" class="badge idle">Idle</div>
+          <div id="partnerName" class="partner-name">No partner</div>
+          <div id="connectionQuality" class="connection-quality hidden">
+            <div class="quality-dot"></div>
+            <span class="quality-text">Good</span>
+          </div>
+        </div>
+        <div id="chatMessages" class="chat-window"></div>
+        <div id="typingIndicator" class="typing-indicator hidden">
+          <span class="typing-dots">
+            <span></span><span></span><span></span>
+          </span>
+          <span class="typing-text">Stranger is typing...</span>
+        </div>
+        <div class="chat-input-area">
+          <input id="chatInput" type="text" placeholder="Say hi..." />
+          <button id="sendBtn" class="btn send-btn">Send</button>
+        </div>
+        <div class="safety-actions">
+          <button id="reportBtn" class="btn danger">Report</button>
+          <button id="blockBtn" class="btn danger-outline">Block</button>
+        </div>
+        <audio id="remoteAudio" autoplay></audio>
+      </section>
+      <aside class="side-ad card">Side Ad (160×600)</aside>
+    </div>
+    <footer class="site-footer">
+      <small>© Strango — Built with ♥</small>
+    </footer>
+  </main>
+  <script>
+    // Country select flag emoji logic (copied from index.html)
+    function countryCodeToFlagEmoji(code) {
+      if (!code || code.toLowerCase() === 'any') return '🌐';
+      code = code.toUpperCase();
+      const A = 0x1F1E6;
+      return Array.from(code).map(c => String.fromCodePoint(A + c.charCodeAt(0) - 65)).join('');
+    }
+    document.addEventListener('DOMContentLoaded', () => {
+      const countrySelect = document.getElementById('country');
+      if (!countrySelect) return;
+      for (const opt of Array.from(countrySelect.options)) {
+        const flag = countryCodeToFlagEmoji(opt.value);
+        opt.text = flag + '  ' + opt.text;
+      }
+      const preview = document.getElementById('countryPreview');
+      if (preview) {
+        const update = () => {
+          const cur = countrySelect.value;
+          preview.textContent = countryCodeToFlagEmoji(cur);
+        };
+        countrySelect.addEventListener('change', update);
+        update();
+      }
+    });
+  </script>
+</body>
+</html>
