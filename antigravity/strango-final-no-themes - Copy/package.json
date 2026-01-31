@@ -1,0 +1,49 @@
+{
+  "name": "strango",
+  "version": "1.0.0",
+  "description": "Anonymous voice and text chat application connecting strangers worldwide",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js",
+    "dev": "NODE_ENV=development node server/server.js",
+    "prod": "NODE_ENV=production node server/server.js",
+    "pm2:start": "pm2 start ecosystem.config.js --env production",
+    "pm2:stop": "pm2 stop strango-server",
+    "pm2:restart": "pm2 restart strango-server",
+    "pm2:logs": "pm2 logs strango-server",
+    "pm2:monitor": "pm2 monit",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "chat",
+    "voice",
+    "webrtc",
+    "anonymous",
+    "strangers",
+    "socket.io",
+    "real-time"
+  ],
+  "author": "Strango Team",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "express": "^5.2.1",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.3"
+  },
+  "devDependencies": {
+    "pm2": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=16.0.0",
+    "npm": ">=8.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/strango.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-username/strango/issues"
+  },
+  "homepage": "https://github.com/your-username/strango#readme"
+}
