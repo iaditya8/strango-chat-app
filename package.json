@@ -40,10 +40,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-username/strango.git"
+    "url": "https://github.com/iaditya8/strango-chat-app.git"
   },
   "bugs": {
-    "url": "https://github.com/your-username/strango/issues"
+    "url": "https://github.com/iaditya8/strango-chat-app/issues"
   },
-  "homepage": "https://github.com/your-username/strango#readme"
+  "homepage": "https://github.com/iaditya8/strango-chat-app#readme"
 }
