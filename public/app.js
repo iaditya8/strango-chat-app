@@ -979,18 +979,17 @@ socket.on('emoji-reaction', ({ emoji }) => {
   addMessage(`${emoji} reaction`, 'reaction');
 });
 
-/* ---- RATING SYSTEM ---- */
+/* ---- RATING SYSTEM (MINIMIZED) ---- */
 const ratingModal = document.getElementById('ratingModal');
 const ratingPartnerName = document.getElementById('ratingPartnerName');
-const starButtons = document.querySelectorAll('.star-btn');
-const ratingComment = document.getElementById('ratingComment');
+const starButtons = document.querySelectorAll('.star-btn-mini');
 const submitRating = document.getElementById('submitRating');
 const skipRating = document.getElementById('skipRating');
 
 let currentRating = 0;
 let ratingPartner = null;
 
-// Star rating interaction
+// Star rating interaction (minimized)
 starButtons.forEach((star, index) => {
   star.addEventListener('click', () => {
     currentRating = index + 1;
@@ -1003,7 +1002,7 @@ starButtons.forEach((star, index) => {
   });
 });
 
-document.querySelector('.rating-stars').addEventListener('mouseleave', () => {
+document.querySelector('.rating-stars-mini').addEventListener('mouseleave', () => {
   updateStarDisplay(currentRating);
 });
 
@@ -1017,7 +1016,7 @@ submitRating.addEventListener('click', () => {
   if (currentRating > 0) {
     const feedback = {
       rating: currentRating,
-      comment: ratingComment.value.trim(),
+      comment: '', // No comment in minimized version
       partnerName: ratingPartner
     };
     
@@ -1027,8 +1026,8 @@ submitRating.addEventListener('click', () => {
     // Close modal and reset
     closeRatingModal();
     
-    // Show thank you message
-    addMessage('✨ Thank you for your feedback!', 'system');
+    // Show brief thank you message
+    addMessage(`⭐ Thanks for rating! (${currentRating}/5 stars)`, 'system');
   }
 });
 
@@ -1044,8 +1043,14 @@ function showRatingModal(partnerDisplayName) {
   // Reset form
   currentRating = 0;
   updateStarDisplay(0);
-  ratingComment.value = '';
   submitRating.disabled = true;
+  
+  // Auto-close after 10 seconds if no interaction
+  setTimeout(() => {
+    if (!ratingModal.classList.contains('hidden')) {
+      closeRatingModal();
+    }
+  }, 10000);
 }
 
 function closeRatingModal() {

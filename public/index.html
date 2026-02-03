@@ -455,26 +455,23 @@
       </footer>
     </main>
 
-    <!-- NEW: Rating Modal -->
+    <!-- NEW: Rating Modal (Minimized) -->
     <div id="ratingModal" class="modal-overlay hidden">
-      <div class="modal-content rating-modal">
-        <div class="modal-header">
-          <h3>Rate Your Conversation</h3>
-          <p>How was your chat with <span id="ratingPartnerName">this person</span>?</p>
+      <div class="modal-content rating-modal-mini">
+        <div class="modal-header-mini">
+          <h4>Quick Rating</h4>
+          <p>Rate <span id="ratingPartnerName">this person</span></p>
         </div>
-        <div class="rating-stars">
-          <button class="star-btn" data-rating="1">⭐</button>
-          <button class="star-btn" data-rating="2">⭐</button>
-          <button class="star-btn" data-rating="3">⭐</button>
-          <button class="star-btn" data-rating="4">⭐</button>
-          <button class="star-btn" data-rating="5">⭐</button>
+        <div class="rating-stars-mini">
+          <button class="star-btn-mini" data-rating="1">⭐</button>
+          <button class="star-btn-mini" data-rating="2">⭐</button>
+          <button class="star-btn-mini" data-rating="3">⭐</button>
+          <button class="star-btn-mini" data-rating="4">⭐</button>
+          <button class="star-btn-mini" data-rating="5">⭐</button>
         </div>
-        <div class="rating-feedback">
-          <textarea id="ratingComment" placeholder="Optional: Share your feedback (anonymous)" maxlength="200"></textarea>
-        </div>
-        <div class="modal-actions">
-          <button id="submitRating" class="btn primary" disabled>Submit Rating</button>
-          <button id="skipRating" class="btn secondary">Skip</button>
+        <div class="modal-actions-mini">
+          <button id="submitRating" class="btn-mini primary" disabled>Rate</button>
+          <button id="skipRating" class="btn-mini secondary">Skip</button>
         </div>
       </div>
     </div>
