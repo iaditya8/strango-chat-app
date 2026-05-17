@@ -59,8 +59,21 @@ let userIdentity = {
   username: null,
   email: null,
   userId: null,
+  deviceId: null,
   isGuest: true
 };
+
+function getOrCreateDeviceId() {
+  let deviceId = localStorage.getItem('strango_device_id');
+  if (!deviceId) {
+    const randomId = window.crypto?.randomUUID
+      ? window.crypto.randomUUID()
+      : `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    deviceId = `device_${randomId}`;
+    localStorage.setItem('strango_device_id', deviceId);
+  }
+  return deviceId;
+}
 
 // Login option switching
 sessionLoginRadio.addEventListener('change', () => {
@@ -122,14 +135,16 @@ function validateLogin() {
     if (!/^[a-zA-Z0-9_]+$/.test(username)) {
       return { valid: false, message: 'Username can only contain letters, numbers, and underscores' };
     }
-    return { valid: true, type: 'session', username, userId: `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}` };
+    const deviceId = getOrCreateDeviceId();
+    return { valid: true, type: 'session', username, deviceId, userId: `guest_${deviceId}` };
   } else {
     const email = emailInput.value.trim();
     if (!email || !email.includes('@')) {
       return { valid: false, message: 'Please enter a valid email address' };
     }
     const username = email.split('@')[0].replace(/[^a-zA-Z0-9]/g, '_');
-    return { valid: true, type: 'persistent', email, username, userId: `persistent_${email}` };
+    const deviceId = getOrCreateDeviceId();
+    return { valid: true, type: 'persistent', email, username, deviceId, userId: `persistent_${email.toLowerCase()}` };
   }
 }
 
@@ -144,6 +159,7 @@ function initializeLogin() {
         // Auto-fill persistent login
         persistentLoginRadio.checked = true;
         emailInput.value = userData.email;
+        userIdentity.deviceId = getOrCreateDeviceId();
         switchLoginOption('persistent');
         return;
       }
@@ -155,6 +171,41 @@ function initializeLogin() {
   // Default to session login
   sessionLoginRadio.checked = true;
   switchLoginOption('session');
+}
+
+function restoreIdentityForCompletedSession() {
+  const deviceId = getOrCreateDeviceId();
+  const savedLogin = localStorage.getItem('strango_user');
+  if (savedLogin) {
+    try {
+      const userData = JSON.parse(savedLogin);
+      if (userData.type === 'persistent' && userData.email) {
+        userIdentity = {
+          type: 'persistent',
+          username: userData.username,
+          email: userData.email,
+          userId: userData.userId || `persistent_${userData.email.toLowerCase()}`,
+          deviceId,
+          isGuest: false
+        };
+        displayNameInput.value = userIdentity.username || '';
+        return;
+      }
+    } catch {
+      localStorage.removeItem('strango_user');
+    }
+  }
+
+  const username = displayNameInput.value.trim() || `Guest_${deviceId.slice(-6)}`;
+  userIdentity = {
+    type: 'session',
+    username,
+    email: null,
+    userId: `guest_${deviceId}`,
+    deviceId,
+    isGuest: true
+  };
+  displayNameInput.value = username;
 }
 
 /* =========================
@@ -201,11 +252,15 @@ const AUDIO_ACTIVITY_THRESHOLD = 0.01;
    INITIAL UI STATE
 ========================= */
 window.addEventListener('DOMContentLoaded', () => {
+  userIdentity.deviceId = getOrCreateDeviceId();
+  loadRtcConfig();
+
   // Check if user has already completed landing page in this session
   const hasCompletedLanding = sessionStorage.getItem('strango_completed_landing');
   
   if (hasCompletedLanding === 'true') {
     // Skip landing page and go directly to main app (same session)
+    restoreIdentityForCompletedSession();
     landingPage.style.display = 'none';
     mainPage.classList.remove('hidden');
     statusEl.textContent = 'Ready to connect';
@@ -257,6 +312,7 @@ startLandingBtn.addEventListener('click', () => {
     username: loginValidation.username,
     email: loginValidation.email || null,
     userId: loginValidation.userId,
+    deviceId: loginValidation.deviceId || getOrCreateDeviceId(),
     isGuest: loginValidation.type === 'session'
   };
   
@@ -432,9 +488,22 @@ let peerConnection = null;
 let currentRoomId = null;
 let isInitiator = false;
 
-const rtcConfig = {
+let rtcConfig = {
   iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
 };
+
+async function loadRtcConfig() {
+  try {
+    const res = await fetch('/config/rtc', { credentials: 'same-origin' });
+    if (!res.ok) return;
+    const config = await res.json();
+    if (Array.isArray(config.iceServers) && config.iceServers.length > 0) {
+      rtcConfig = { iceServers: config.iceServers };
+    }
+  } catch (err) {
+    console.log('Using fallback RTC config:', err);
+  }
+}
 
 /* =========================
    START MATCHMAKING
@@ -550,10 +619,17 @@ socket.on('webrtc-ice-candidate', async ({ candidate }) => {
 });
 
 socket.on('partner-left', () => {
+  const previousPartnerName = partnerName.textContent;
   statusEl.textContent = 'Partner disconnected';
   partnerName.textContent = 'No partner';
   
   endCall(false);
+
+  if (previousPartnerName !== 'No partner' && previousPartnerName !== 'Searching...') {
+    setTimeout(() => {
+      showRatingModal(previousPartnerName);
+    }, 1000);
+  }
   
   // Check if reconnection is available AFTER endCall
   addMessage('⚠️ Partner disconnected. Checking if reconnection is available...', 'system');
@@ -886,31 +962,6 @@ function sendMessage() {
   chatInput.value = '';
 }
 
-function addMessage(text, type) {
-  const div = document.createElement('div');
-  div.className = `chat-message ${type}`;
-  div.textContent = text;
-  chatMessages.appendChild(div);
-  
-  // Remove empty state if it exists
-  const emptyState = chatMessages.querySelector('.empty-state');
-  if (emptyState) {
-    emptyState.remove();
-  }
-  
-  chatMessages.scrollTop = chatMessages.scrollHeight;
-  
-  // Track chat activity for auto-next
-  if (type === 'self' || type === 'stranger') {
-    lastChatActivity = Date.now();
-  }
-  
-  // Add send animation feedback
-  if (type === 'self') {
-    div.style.animation = 'slideIn 0.3s ease';
-  }
-}
-
 /* =========================
    SAFETY
 ========================= */
@@ -1126,22 +1177,37 @@ function addMessage(msg, type = 'user') {
   messageEl.className = `chat-message ${type}`;
   
   if (type === 'reaction') {
-    messageEl.innerHTML = `
-      <div class="message-content reaction-message">
-        <span class="reaction-emoji">${msg.split(' ')[0]}</span>
-        <span class="reaction-text">sent a reaction</span>
-      </div>
-      <div class="message-time">${new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</div>
-    `;
+    const content = document.createElement('div');
+    content.className = 'message-content reaction-message';
+
+    const emojiSpan = document.createElement('span');
+    emojiSpan.className = 'reaction-emoji';
+    emojiSpan.textContent = String(msg || '').split(' ')[0] || '🙂';
+
+    const textSpan = document.createElement('span');
+    textSpan.className = 'reaction-text';
+    textSpan.textContent = 'sent a reaction';
+
+    content.appendChild(emojiSpan);
+    content.appendChild(textSpan);
+    messageEl.appendChild(content);
   } else {
-    messageEl.innerHTML = `
-      <div class="message-content">${escapeHtml(msg)}</div>
-      <div class="message-time">${new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</div>
-    `;
+    const content = document.createElement('div');
+    content.className = 'message-content';
+    content.textContent = String(msg || '');
+    messageEl.appendChild(content);
   }
+
+  const timeEl = document.createElement('div');
+  timeEl.className = 'message-time';
+  timeEl.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  messageEl.appendChild(timeEl);
   
   chatMessages.appendChild(messageEl);
   chatMessages.scrollTop = chatMessages.scrollHeight;
+  if (type === 'self' || type === 'stranger') {
+    lastChatActivity = Date.now();
+  }
   
   // Remove empty state if it exists
   const emptyState = chatMessages.querySelector('.empty-state');
@@ -1149,39 +1215,6 @@ function addMessage(msg, type = 'user') {
     emptyState.remove();
   }
 }
-
-function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
-}
-
-/* ---- ENHANCED PARTNER DISCONNECT HANDLING ---- */
-const originalPartnerLeftHandler = socket._callbacks['$partner-left'];
-socket.off('partner-left');
-
-socket.on('partner-left', () => {
-  const currentPartnerName = partnerName.textContent;
-  
-  // Show rating modal if we had a meaningful conversation
-  if (currentPartnerName !== 'No partner' && currentPartnerName !== 'Searching...') {
-    setTimeout(() => {
-      showRatingModal(currentPartnerName);
-    }, 1000); // Delay to let user process the disconnect
-  }
-  
-  // Call original handler
-  if (originalPartnerLeftHandler && originalPartnerLeftHandler.length > 0) {
-    originalPartnerLeftHandler[0]();
-  } else {
-    // Fallback handling
-    endCall(false);
-    addMessage('⚠️ Partner disconnected. Checking if reconnection is available...', 'system');
-    setTimeout(() => {
-      socket.emit('check-reconnection');
-    }, 1000);
-  }
-});
 
 /* ---- SERVER EVENT HANDLERS FOR NEW FEATURES ---- */
 socket.on('rating-received', ({ rating, comment }) => {

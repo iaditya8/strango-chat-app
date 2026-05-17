@@ -12,7 +12,8 @@
     "pm2:restart": "pm2 restart strango-server",
     "pm2:logs": "pm2 logs strango-server",
     "pm2:monitor": "pm2 monit",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test --test-force-exit",
+    "check": "node --check server/server.js && node --check public/app.js"
   },
   "keywords": [
     "chat",
@@ -27,7 +28,12 @@
   "license": "MIT",
   "type": "commonjs",
   "dependencies": {
+    "@socket.io/redis-adapter": "^8.3.0",
     "express": "^5.2.1",
+    "express-rate-limit": "^7.5.1",
+    "helmet": "^8.1.0",
+    "pg": "^8.16.0",
+    "redis": "^4.7.0",
     "socket.io": "^4.8.1",
     "socket.io-client": "^4.8.3"
   },

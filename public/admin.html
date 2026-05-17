@@ -151,21 +151,33 @@
 
         usersBody.innerHTML = '';
 
+        function appendCell(row, value) {
+          const td = document.createElement('td');
+          td.textContent = value;
+          row.appendChild(td);
+          return td;
+        }
+
         data.users.forEach(u => {
           const tr = document.createElement('tr');
 
           const status = u.partner ? 'Paired' : 'Waiting/Idle';
           const statusClass = u.partner ? 'status-chip status-paired' : 'status-chip status-alone';
 
-          tr.innerHTML = `
-            <td>${u.id.slice(0, 8)}...</td>
-            <td>${u.name}</td>
-            <td>${u.country}</td>
-            <td>${u.gender}</td>
-            <td><span class="${statusClass}">${status}</span></td>
-            <td>${u.partner ? u.partner.slice(0, 8) + '...' : '-'}</td>
-            <td>${u.connectedForSeconds}</td>
-          `;
+          appendCell(tr, u.id.slice(0, 8) + '...');
+          appendCell(tr, u.name);
+          appendCell(tr, u.country);
+          appendCell(tr, u.gender);
+
+          const statusTd = document.createElement('td');
+          const statusSpan = document.createElement('span');
+          statusSpan.className = statusClass;
+          statusSpan.textContent = status;
+          statusTd.appendChild(statusSpan);
+          tr.appendChild(statusTd);
+
+          appendCell(tr, u.partner ? u.partner.slice(0, 8) + '...' : '-');
+          appendCell(tr, u.connectedForSeconds);
 
           usersBody.appendChild(tr);
         });

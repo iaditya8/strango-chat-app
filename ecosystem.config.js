@@ -14,12 +14,18 @@ module.exports = {
     env: {
       NODE_ENV: 'development',
       PORT: 4000,
-      MAX_CONNECTIONS: 1000
+      MAX_CONNECTIONS: 1000,
+      ADMIN_USERNAME: 'admin',
+      ADMIN_PASSWORD: 'admin'
     },
     env_production: {
       NODE_ENV: 'production',
       PORT: 4000,
-      MAX_CONNECTIONS: 2000
+      MAX_CONNECTIONS: 2000,
+      ALLOWED_ORIGINS: 'https://your-domain.com',
+      REDIS_URL: 'redis://localhost:6379',
+      ADMIN_USERNAME: 'replace-me',
+      ADMIN_PASSWORD: 'replace-with-a-long-random-password'
     },
     
     // Logging

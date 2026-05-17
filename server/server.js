@@ -2,11 +2,31 @@
 const express = require('express');
 const http = require('http');
 const path = require('path');
+const crypto = require('crypto');
 const { Server } = require('socket.io');
 const { addToQueue, removeFromQueue, findMatchFor } = require('./matchmaking');
+const { createStore } = require('./store');
+const { adminAuthConfigured, requireAdmin, validateOrigin } = require('./security');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const server = http.createServer(app);
+const store = createStore();
+
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const PORT = process.env.PORT || 4000;
+const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS || 2000);
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+const ALLOW_ALL_ORIGINS = ALLOWED_ORIGINS.length === 0 && NODE_ENV !== 'production';
+const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN || '';
+
+function asyncHandler(fn) {
+  return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+}
 
 // PERFORMANCE: Optimize Socket.IO for high concurrency
 const io = new Server(server, {
@@ -18,12 +38,39 @@ const io = new Server(server, {
   compression: true,
   // Optimize transport
   transports: ['websocket', 'polling'],
+  cors: {
+    origin: (origin, callback) => {
+      if (ALLOW_ALL_ORIGINS) return callback(null, true);
+      if (validateOrigin(origin, ALLOWED_ORIGINS)) return callback(null, true);
+      callback(new Error('Origin not allowed'));
+    }
+  },
   // Connection state recovery
   connectionStateRecovery: {
     maxDisconnectionDuration: 2 * 60 * 1000, // 2 minutes
     skipMiddlewares: true,
   }
 });
+
+if (process.env.REDIS_URL) {
+  try {
+    const { createClient } = require('redis');
+    const { createAdapter } = require('@socket.io/redis-adapter');
+    const pubClient = createClient({ url: process.env.REDIS_URL });
+    const subClient = pubClient.duplicate();
+
+    Promise.all([pubClient.connect(), subClient.connect()])
+      .then(() => {
+        io.adapter(createAdapter(pubClient, subClient));
+        console.log('Socket.IO Redis adapter enabled');
+      })
+      .catch(err => {
+        console.warn(`Redis adapter disabled: ${err.message}`);
+      });
+  } catch (err) {
+    console.warn(`Redis adapter packages unavailable: ${err.message}`);
+  }
+}
 
 // PERFORMANCE: Set process limits
 process.setMaxListeners(0); // Remove EventEmitter limit
@@ -70,21 +117,15 @@ function getConversationStarter() {
 
 // PERFORMANCE: Use Maps for O(1) lookups instead of objects
 const users = new Map();          // socketId -> user object
-const reports = new Map();        // socketId -> report count
-const bannedUsers = new Set();
 const recentPartners = new Map(); // socketId -> { partnerId, timestamp, partnerName }
 const reconnectRequests = new Map(); // socketId -> { requesterId, timestamp }
 
-// NEW FEATURES: Additional state management
-const userRatings = new Map();    // socketId -> { ratings: [], averageRating: number }
-const appeals = new Map();        // appealId -> appeal object
-
 // Connection tracking for limits
 let activeConnections = 0;
-const MAX_CONNECTIONS = process.env.MAX_CONNECTIONS || 2000;
 
 // PERFORMANCE: Reconnection token system with Map for O(1) access
 const reconnectableSessions = new Map(); // reconnectToken -> { userA, userB, roomId, timestamp, attempts }
+const intervalHandles = [];
 
 function generateReconnectToken() {
   return `reconnect_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -99,7 +140,8 @@ const MAX_SKIPS = 3;
 const SKIP_WINDOW_MS = 30000; // 30 seconds
 
 // PERFORMANCE: Batch cleanup of old skip records
-setInterval(() => {
+{
+  const handle = setInterval(() => {
   const now = Date.now();
   for (const [socketId, timestamps] of skipTracker.entries()) {
     const validTimestamps = timestamps.filter(t => now - t < SKIP_WINDOW_MS);
@@ -109,7 +151,10 @@ setInterval(() => {
       skipTracker.set(socketId, validTimestamps);
     }
   }
-}, 30000);
+  }, 30000);
+  handle.unref();
+  intervalHandles.push(handle);
+}
 
 
 /* =========================
@@ -118,6 +163,32 @@ setInterval(() => {
 
 app.use(express.json({ limit: '1mb' }));
 
+app.use(helmet({
+  frameguard: { action: 'deny' }
+}));
+
+app.use(rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.HTTP_RATE_LIMIT_PER_MIN || 300),
+  standardHeaders: true,
+  legacyHeaders: false
+}));
+
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), geolocation=(), payment=()');
+  if (NODE_ENV === 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
+
+app.use('/admin.html', requireAdmin);
+app.use('/admin', requireAdmin);
+
 // PERFORMANCE: Enable compression and caching
 app.use(express.static(path.join(__dirname, '../public'), {
   maxAge: '1d', // Cache static files for 1 day
@@ -125,27 +196,23 @@ app.use(express.static(path.join(__dirname, '../public'), {
   lastModified: true
 }));
 
-// PERFORMANCE: Add security headers
-app.use((req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('X-XSS-Protection', '1; mode=block');
-  next();
-});
-
 /* =========================
    ADMIN ENDPOINTS (OPTIMIZED)
 ========================= */
 
-app.get('/admin/users', (req, res) => {
+app.get('/admin/users', asyncHandler(async (req, res) => {
   const now = Date.now();
+  const ratingsByUserId = await store.listRatings();
 
   // PERFORMANCE: Use Map iteration instead of Object.entries
   const list = [];
   for (const [id, u] of users.entries()) {
-    const userRating = userRatings.get(id);
+    const durableUserId = u.userId || id;
+    const userRating = ratingsByUserId[durableUserId];
+    const ban = await store.getBan(durableUserId);
     list.push({
       id,
+      userId: durableUserId,
       name: u.name || 'Stranger',
       username: u.username || 'Anonymous',
       country: u.country || 'any',
@@ -155,25 +222,27 @@ app.get('/admin/users', (req, res) => {
       connectedForSeconds: Math.floor((now - u.connectedAt) / 1000),
       averageRating: userRating ? userRating.averageRating.toFixed(1) : 'N/A',
       totalRatings: userRating ? userRating.ratings.length : 0,
-      reportCount: reports.get(id) || 0,
-      isBanned: bannedUsers.has(id)
+      reportCount: await store.getReportCount(durableUserId),
+      isBanned: Boolean(ban)
     });
   }
 
+  const bans = await store.listBans();
+  const appeals = await store.listAppeals();
   res.json({
     totalOnline: list.length,
     activeCalls: Math.floor(list.filter(u => u.partner).length / 2),
     maxConnections: MAX_CONNECTIONS,
     memoryUsage: process.memoryUsage(),
-    bannedUsers: bannedUsers.size,
-    pendingAppeals: Array.from(appeals.values()).filter(a => a.status === 'pending').length,
+    bannedUsers: bans.length,
+    pendingAppeals: appeals.filter(a => a.status === 'pending').length,
     users: list,
   });
-});
+}));
 
 // NEW: Appeals management endpoint
-app.get('/admin/appeals', (req, res) => {
-  const appealsList = Array.from(appeals.values()).map(appeal => ({
+app.get('/admin/appeals', asyncHandler(async (req, res) => {
+  const appealsList = (await store.listAppeals()).map(appeal => ({
     ...appeal,
     timeAgo: Math.floor((Date.now() - appeal.timestamp) / (1000 * 60)) + ' minutes ago'
   }));
@@ -185,48 +254,51 @@ app.get('/admin/appeals', (req, res) => {
     denied: appealsList.filter(a => a.status === 'denied').length,
     appeals: appealsList.sort((a, b) => b.timestamp - a.timestamp)
   });
-});
+}));
 
 // NEW: Appeal decision endpoint
-app.post('/admin/appeals/:appealId/decision', express.json(), (req, res) => {
+app.post('/admin/appeals/:appealId/decision', express.json(), requireAdminApiToken, asyncHandler(async (req, res) => {
   const { appealId } = req.params;
   const { decision, adminMessage } = req.body; // decision: 'approve' or 'deny'
   
-  const appeal = appeals.get(appealId);
+  const appeal = await store.getAppeal(appealId);
   if (!appeal) {
     return res.status(404).json({ error: 'Appeal not found' });
   }
+
+  if (!['approve', 'deny'].includes(decision)) {
+    return res.status(400).json({ error: 'decision must be approve or deny' });
+  }
   
-  appeal.status = decision === 'approve' ? 'approved' : 'denied';
-  appeal.adminMessage = adminMessage || '';
-  appeal.reviewedAt = Date.now();
+  const updatedAppeal = await store.updateAppeal(appealId, {
+    status: decision === 'approve' ? 'approved' : 'denied',
+    adminMessage: String(adminMessage || '').slice(0, 500)
+  });
   
   // If approved, remove from banned users
   if (decision === 'approve') {
-    bannedUsers.delete(appeal.userId);
+    await store.unbanUser(appeal.userId, 'appeal-approved');
     console.log(`Appeal ${appealId} approved - user ${appeal.userId} unbanned`);
   } else {
     console.log(`Appeal ${appealId} denied`);
   }
   
   // Notify user if they're online
-  const userSocket = io.sockets.sockets.get(appeal.userId);
-  if (userSocket) {
-    userSocket.emit('appeal-status', {
-      status: appeal.status,
-      message: adminMessage || (decision === 'approve' ? 'Your appeal has been approved.' : 'Your appeal has been denied.')
-    });
-  }
+  notifyDurableUser(appeal.userId, 'appeal-status', {
+    status: updatedAppeal.status,
+    message: adminMessage || (decision === 'approve' ? 'Your appeal has been approved.' : 'Your appeal has been denied.')
+  });
   
-  res.json({ success: true, appeal });
-});
+  res.json({ success: true, appeal: updatedAppeal });
+}));
 
 // NEW: User ratings endpoint
-app.get('/admin/ratings', (req, res) => {
+app.get('/admin/ratings', asyncHandler(async (req, res) => {
   const ratingsList = [];
+  const ratings = await store.listRatings();
   
-  for (const [userId, ratingData] of userRatings.entries()) {
-    const user = users.get(userId);
+  for (const [userId, ratingData] of Object.entries(ratings)) {
+    const user = Array.from(users.values()).find(activeUser => activeUser.userId === userId);
     ratingsList.push({
       userId,
       username: user ? (user.username || 'Anonymous') : 'Disconnected',
@@ -250,21 +322,43 @@ app.get('/admin/ratings', (req, res) => {
       : 'N/A',
     ratings: ratingsList
   });
-});
+}));
 
 // PERFORMANCE: Add health check endpoint
-app.get('/health', (req, res) => {
+app.get('/health', asyncHandler(async (req, res) => {
+  const ratings = await store.listRatings();
+  const appeals = await store.listAppeals();
+  const bans = await store.listBans();
   res.json({
     status: 'healthy',
     uptime: process.uptime(),
     connections: activeConnections,
     memory: process.memoryUsage().heapUsed / 1024 / 1024, // MB
+    auth: {
+      adminConfigured: adminAuthConfigured()
+    },
+    scaling: {
+      redisConfigured: Boolean(process.env.REDIS_URL)
+    },
     features: {
-      ratings: userRatings.size,
-      appeals: appeals.size,
-      bannedUsers: bannedUsers.size
+      ratings: Object.keys(ratings).length,
+      appeals: appeals.length,
+      bannedUsers: bans.length
     }
   });
+}));
+
+app.get('/config/rtc', (req, res) => {
+  const iceServers = [{ urls: process.env.STUN_URL || 'stun:stun.l.google.com:19302' }];
+  if (process.env.TURN_URL && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
+    iceServers.push({
+      urls: process.env.TURN_URL,
+      username: process.env.TURN_USERNAME,
+      credential: process.env.TURN_CREDENTIAL
+    });
+  }
+
+  res.json({ iceServers });
 });
 
 /* =========================
@@ -273,6 +367,50 @@ app.get('/health', (req, res) => {
 
 function pickInitiator(a, b) {
   return a < b ? a : b;
+}
+
+function sanitizeText(value, maxLength) {
+  return String(value || '').trim().slice(0, maxLength);
+}
+
+function generateId(prefix) {
+  return `${prefix}_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+}
+
+function getDurableUserId(socketId) {
+  const user = users.get(socketId);
+  return user?.userId || `socket_${socketId}`;
+}
+
+function getPublicName(user) {
+  return user?.username || user?.name || 'Stranger';
+}
+
+function formatBanPayload(ban) {
+  const remainingMs = Math.max(0, ban.expiresAt - Date.now());
+  const hours = Math.max(1, Math.ceil(remainingMs / (60 * 60 * 1000)));
+  return {
+    reason: ban.reason,
+    duration: hours >= 24 ? `${Math.ceil(hours / 24)} day(s)` : `${hours} hour(s)`,
+    expires: new Date(ban.expiresAt).toLocaleString()
+  };
+}
+
+function notifyDurableUser(userId, eventName, payload) {
+  for (const [socketId, user] of users.entries()) {
+    if (user.userId === userId) {
+      io.to(socketId).emit(eventName, payload);
+    }
+  }
+}
+
+function requireAdminApiToken(req, res, next) {
+  if (!ADMIN_API_TOKEN) return next();
+  const provided = String(req.headers['x-admin-token'] || '');
+  if (provided !== ADMIN_API_TOKEN) {
+    return res.status(403).json({ error: 'Missing or invalid admin token' });
+  }
+  next();
 }
 
 function performReconnection(userId1, userId2) {
@@ -308,13 +446,13 @@ function performReconnection(userId1, userId2) {
   io.to(userId1).emit('partner-reconnected', {
     roomId,
     initiator: initiator === userId1,
-    partnerName: user2.name || 'Stranger',
+    partnerName: getPublicName(user2),
   });
 
   io.to(userId2).emit('partner-reconnected', {
     roomId,
     initiator: initiator === userId2,
-    partnerName: user1.name || 'Stranger',
+    partnerName: getPublicName(user1),
   });
 }
 
@@ -343,16 +481,21 @@ function cleanUser(id) {
     recentPartners.set(id, {
       partnerId: user.partner,
       timestamp: Date.now(),
-      partnerName: partner.name || 'Stranger'
+      partnerName: getPublicName(partner)
     });
     
     recentPartners.set(user.partner, {
       partnerId: id,
       timestamp: Date.now(),
-      partnerName: user.name || 'Stranger'
+      partnerName: getPublicName(user)
     });
 
     console.log(`Stored recent partners: ${id} <-> ${user.partner}`);
+
+    user.lastPartner = user.partner;
+    user.lastPartnerUserId = partner.userId || user.partner;
+    partner.lastPartner = id;
+    partner.lastPartnerUserId = user.userId || id;
 
     partner.partner = null;
     partner.roomId = null;
@@ -414,6 +557,7 @@ io.on('connection', socket => {
     username: null,
     email: null,
     userId: null,
+    deviceId: null,
     loginType: 'session', // 'session' or 'persistent'
     isGuest: true
   });
@@ -442,32 +586,21 @@ io.on('connection', socket => {
     socket.to(roomId).emit('chat-message', { msg: sanitizedMsg });
   });
 
-  /* ---- REPORT (OPTIMIZED) ---- */
-  socket.on('report-user', ({ roomId }) => {
-    const user = users.get(socket.id);
-    if (!user || !user.partner) return;
-
-    const offender = user.partner;
-    const currentReports = reports.get(offender) || 0;
-    reports.set(offender, currentReports + 1);
-
-    if (reports.get(offender) >= 3) {
-      bannedUsers.add(offender);
-    }
-
-    cleanUser(offender);
-    cleanUser(socket.id);
-
-    io.to(roomId).emit('partner-left');
-  });
-
   /* ---- BLOCK (OPTIMIZED) ---- */
-  socket.on('block-user', ({ roomId }) => {
+  socket.on('block-user', async ({ roomId }) => {
     const user = users.get(socket.id);
     if (!user || !user.partner) return;
 
-    bannedUsers.add(user.partner);
-    cleanUser(user.partner);
+    const offenderSocketId = user.partner;
+    const offenderUserId = getDurableUserId(offenderSocketId);
+    const ban = await store.banUser(
+      offenderUserId,
+      'Blocked by chat partner',
+      24 * 60 * 60 * 1000,
+      getDurableUserId(socket.id)
+    );
+    io.to(offenderSocketId).emit('user-banned', formatBanPayload(ban));
+    cleanUser(offenderSocketId);
     cleanUser(socket.id);
 
     io.to(roomId).emit('partner-left');
@@ -490,63 +623,52 @@ io.on('connection', socket => {
   });
 
   /* ---- NEW FEATURES: RATING SYSTEM ---- */
-  socket.on('submit-rating', ({ rating, comment, partnerName }) => {
+  socket.on('submit-rating', async ({ rating, comment, partnerName }) => {
     const user = users.get(socket.id);
-    if (!user || !user.partner) return;
+    if (!user) return;
     
     // Validate rating
-    if (rating < 1 || rating > 5) return;
+    const numericRating = Number(rating);
+    if (!Number.isInteger(numericRating) || numericRating < 1 || numericRating > 5) return;
     
-    const partnerId = user.partner;
+    const partnerId = user.partner || user.lastPartner;
     const partnerUser = users.get(partnerId);
     
-    if (partnerUser) {
+    if (partnerId) {
+      const ratedUserId = partnerUser?.userId || user.lastPartnerUserId || partnerId;
       // Store rating for partner
-      if (!userRatings.has(partnerId)) {
-        userRatings.set(partnerId, { ratings: [], averageRating: 0 });
-      }
-      
-      const partnerRatings = userRatings.get(partnerId);
-      partnerRatings.ratings.push({
-        rating,
-        comment: comment || '',
-        timestamp: Date.now(),
-        fromUser: user.username || 'Anonymous'
-      });
-      
-      // Calculate new average
-      const totalRatings = partnerRatings.ratings.reduce((sum, r) => sum + r.rating, 0);
-      partnerRatings.averageRating = totalRatings / partnerRatings.ratings.length;
+      await store.addRating(
+        ratedUserId,
+        numericRating,
+        sanitizeText(comment, 300),
+        getDurableUserId(socket.id)
+      );
       
       // Notify partner if rating is good
-      if (rating >= 4) {
-        io.to(partnerId).emit('rating-received', { rating, comment });
+      if (numericRating >= 4 && partnerUser) {
+        io.to(partnerId).emit('rating-received', { rating: numericRating, comment: sanitizeText(comment, 300) });
       }
       
-      console.log(`Rating submitted: ${rating}/5 for user ${partnerId}`);
+      console.log(`Rating submitted: ${numericRating}/5 for user ${ratedUserId}`);
     }
   });
 
   /* ---- NEW FEATURES: APPEAL SYSTEM ---- */
-  socket.on('submit-appeal', ({ reason, message, email }) => {
+  socket.on('submit-appeal', async ({ reason, message, email, userId }) => {
     const user = users.get(socket.id);
     if (!user) return;
     
     // Generate appeal ID
-    const appealId = `appeal_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const appealId = generateId('appeal');
     
-    const appeal = {
+    const appeal = await store.createAppeal({
       id: appealId,
-      userId: socket.id,
+      userId: user.userId || sanitizeText(userId, 120) || socket.id,
       username: user.username || 'Anonymous',
-      reason,
-      message,
-      email,
-      timestamp: Date.now(),
-      status: 'pending'
-    };
-    
-    appeals.set(appealId, appeal);
+      reason: sanitizeText(reason, 80),
+      message: sanitizeText(message, 500),
+      email: sanitizeText(email, 200)
+    });
     
     // Log appeal for admin review
     console.log(`New appeal submitted: ${appealId} by ${user.username || socket.id}`);
@@ -562,38 +684,34 @@ io.on('connection', socket => {
   });
 
   /* ---- ENHANCED REPORT WITH BAN NOTIFICATIONS ---- */
-  socket.on('report-user', ({ roomId }) => {
+  socket.on('report-user', async ({ roomId }) => {
     const user = users.get(socket.id);
     if (!user || !user.partner) return;
 
     const offender = user.partner;
-    const offenderUser = users.get(offender);
-    const currentReports = reports.get(offender) || 0;
-    reports.set(offender, currentReports + 1);
+    const offenderUserId = getDurableUserId(offender);
+    const reportCount = await store.addReport(offenderUserId, getDurableUserId(socket.id));
 
-    console.log(`User ${offender} reported. Total reports: ${currentReports + 1}`);
+    console.log(`User ${offenderUserId} reported. Total reports: ${reportCount}`);
 
-    if (reports.get(offender) >= 3) {
-      bannedUsers.add(offender);
-      
+    if (reportCount >= 3) {
       // Calculate ban duration based on reports
-      const reportCount = reports.get(offender);
-      let banDuration = '24 hours';
-      let banExpires = new Date(Date.now() + 24 * 60 * 60 * 1000).toLocaleString();
+      let banDurationMs = 24 * 60 * 60 * 1000;
       
       if (reportCount >= 5) {
-        banDuration = '7 days';
-        banExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toLocaleString();
+        banDurationMs = 7 * 24 * 60 * 60 * 1000;
       }
+      const ban = await store.banUser(
+        offenderUserId,
+        'Multiple user reports for inappropriate behavior',
+        banDurationMs,
+        'report-threshold'
+      );
       
       // Notify banned user
-      io.to(offender).emit('user-banned', {
-        reason: 'Multiple user reports for inappropriate behavior',
-        duration: banDuration,
-        expires: banExpires
-      });
+      io.to(offender).emit('user-banned', formatBanPayload(ban));
       
-      console.log(`User ${offender} banned for ${banDuration}`);
+      console.log(`User ${offenderUserId} banned until ${new Date(ban.expiresAt).toISOString()}`);
     }
 
     cleanUser(offender);
@@ -665,29 +783,33 @@ io.on('connection', socket => {
         return;
       }
 
-      // Ensure both users exist in users object
-      if (!users[session.userA.socketId]) {
-        users[session.userA.socketId] = {
+      // Ensure both users exist in users map
+      if (!users.has(session.userA.socketId)) {
+        users.set(session.userA.socketId, {
           connectedAt: Date.now(),
           lastActiveAt: Date.now(),
           country: 'any',
           gender: 'any',
           name: session.userA.name,
+          username: session.userA.name,
+          userId: session.userA.userId || `guest_${session.userA.socketId}`,
           partner: null,
           roomId: null,
-        };
+        });
       }
       
-      if (!users[session.userB.socketId]) {
-        users[session.userB.socketId] = {
+      if (!users.has(session.userB.socketId)) {
+        users.set(session.userB.socketId, {
           connectedAt: Date.now(),
           lastActiveAt: Date.now(),
           country: 'any',
           gender: 'any',
           name: session.userB.name,
+          username: session.userB.name,
+          userId: session.userB.userId || `guest_${session.userB.socketId}`,
           partner: null,
           roomId: null,
-        };
+        });
       }
 
       // Rejoin room
@@ -695,13 +817,15 @@ io.on('connection', socket => {
       userBSocket.join(roomId);
 
       // Update user states
-      users[session.userA.socketId].partner = session.userB.socketId;
-      users[session.userA.socketId].roomId = roomId;
-      users[session.userA.socketId].lastActiveAt = Date.now();
+      const userA = users.get(session.userA.socketId);
+      const userB = users.get(session.userB.socketId);
+      userA.partner = session.userB.socketId;
+      userA.roomId = roomId;
+      userA.lastActiveAt = Date.now();
 
-      users[session.userB.socketId].partner = session.userA.socketId;
-      users[session.userB.socketId].roomId = roomId;
-      users[session.userB.socketId].lastActiveAt = Date.now();
+      userB.partner = session.userA.socketId;
+      userB.roomId = roomId;
+      userB.lastActiveAt = Date.now();
 
       const initiator = pickInitiator(session.userA.socketId, session.userB.socketId);
 
@@ -744,21 +868,21 @@ io.on('connection', socket => {
   });
 
   /* ---- OLD RECONNECT PARTNER (DEPRECATED - keeping for backwards compatibility) ---- */
-  socket.on('reconnect-partner', () => {
-    const user = users[socket.id];
-    if (!user || bannedUsers.has(socket.id)) {
+  socket.on('reconnect-partner', async () => {
+    const user = users.get(socket.id);
+    if (!user || await store.getBan(getDurableUserId(socket.id))) {
       socket.emit('reconnect-failed', { reason: 'User not found or banned' });
       return;
     }
 
-    const recentPartner = recentPartners[socket.id];
+    const recentPartner = recentPartners.get(socket.id);
     
     // Check if recent partner exists and is still valid (within 5 minutes)
     if (!recentPartner || Date.now() - recentPartner.timestamp > 300000) {
       // No server-side recent partner, but client might have one
       // Search for any user who has this socket as their recent partner
       let foundPartnerId = null;
-      for (const [userId, partnerData] of Object.entries(recentPartners)) {
+      for (const [userId, partnerData] of recentPartners.entries()) {
         if (partnerData.partnerId === socket.id && Date.now() - partnerData.timestamp <= 300000) {
           foundPartnerId = userId;
           break;
@@ -767,8 +891,8 @@ io.on('connection', socket => {
       
       if (!foundPartnerId) {
         // Try to find by searching all users' recent partners
-        for (const [userId, partnerData] of Object.entries(recentPartners)) {
-          const partner = users[userId];
+        for (const [userId, partnerData] of recentPartners.entries()) {
+          const partner = users.get(userId);
           if (partner && !partner.partner && Date.now() - partnerData.timestamp <= 300000) {
             // This is a potential match - send request
             foundPartnerId = userId;
@@ -783,28 +907,28 @@ io.on('connection', socket => {
       }
       
       // Found a potential partner, send request
-      const partner = users[foundPartnerId];
+      const partner = users.get(foundPartnerId);
       if (!partner || partner.partner) {
         socket.emit('reconnect-failed', { reason: 'Partner is no longer available' });
         return;
       }
       
       // Send reconnection request
-      reconnectRequests[foundPartnerId] = {
+      reconnectRequests.set(foundPartnerId, {
         requesterId: socket.id,
         timestamp: Date.now()
-      };
+      });
 
-      socket.emit('reconnect-request-sent', { partnerName: partner.name || 'Stranger' });
+      socket.emit('reconnect-request-sent', { partnerName: getPublicName(partner) });
       io.to(foundPartnerId).emit('reconnect-request-received', {
-        requesterName: user.name || 'Stranger',
+        requesterName: getPublicName(user),
         requesterId: socket.id
       });
 
       // Auto-expire request after 30 seconds
       setTimeout(() => {
-        if (reconnectRequests[foundPartnerId]?.requesterId === socket.id) {
-          delete reconnectRequests[foundPartnerId];
+        if (reconnectRequests.get(foundPartnerId)?.requesterId === socket.id) {
+          reconnectRequests.delete(foundPartnerId);
           socket.emit('reconnect-request-expired');
           io.to(foundPartnerId).emit('reconnect-request-expired');
         }
@@ -814,7 +938,7 @@ io.on('connection', socket => {
     }
 
     const partnerId = recentPartner.partnerId;
-    const partner = users[partnerId];
+    const partner = users.get(partnerId);
 
     // Check if partner is still online and available
     if (!partner || partner.partner) {
@@ -823,38 +947,38 @@ io.on('connection', socket => {
     }
 
     // Check if partner also wants to reconnect (mutual reconnection)
-    const partnerRecentPartner = recentPartners[partnerId];
+    const partnerRecentPartner = recentPartners.get(partnerId);
     if (!partnerRecentPartner || partnerRecentPartner.partnerId !== socket.id) {
       socket.emit('reconnect-failed', { reason: 'Partner connection mismatch' });
       return;
     }
 
     // Check if there's already a pending request from the partner
-    const existingRequest = reconnectRequests[socket.id];
+    const existingRequest = reconnectRequests.get(socket.id);
     if (existingRequest && existingRequest.requesterId === partnerId) {
       // Partner already sent a request, auto-accept and reconnect
       performReconnection(socket.id, partnerId);
-      delete reconnectRequests[socket.id];
-      delete reconnectRequests[partnerId];
+      reconnectRequests.delete(socket.id);
+      reconnectRequests.delete(partnerId);
       return;
     }
 
     // Send reconnection request to partner
-    reconnectRequests[partnerId] = {
+    reconnectRequests.set(partnerId, {
       requesterId: socket.id,
       timestamp: Date.now()
-    };
+    });
 
     socket.emit('reconnect-request-sent', { partnerName: recentPartner.partnerName });
     io.to(partnerId).emit('reconnect-request-received', {
-      requesterName: user.name || 'Stranger',
+      requesterName: getPublicName(user),
       requesterId: socket.id
     });
 
     // Auto-expire request after 30 seconds
     setTimeout(() => {
-      if (reconnectRequests[partnerId]?.requesterId === socket.id) {
-        delete reconnectRequests[partnerId];
+      if (reconnectRequests.get(partnerId)?.requesterId === socket.id) {
+        reconnectRequests.delete(partnerId);
         socket.emit('reconnect-request-expired');
         io.to(partnerId).emit('reconnect-request-expired');
       }
@@ -863,34 +987,34 @@ io.on('connection', socket => {
 
   /* ---- ACCEPT RECONNECTION REQUEST ---- */
   socket.on('accept-reconnect', ({ requesterId }) => {
-    const request = reconnectRequests[socket.id];
+    const request = reconnectRequests.get(socket.id);
     
     if (!request || request.requesterId !== requesterId) {
       socket.emit('reconnect-failed', { reason: 'Invalid or expired request' });
       return;
     }
 
-    const requester = users[requesterId];
+    const requester = users.get(requesterId);
     if (!requester || requester.partner) {
       socket.emit('reconnect-failed', { reason: 'Requester is no longer available' });
-      delete reconnectRequests[socket.id];
+      reconnectRequests.delete(socket.id);
       return;
     }
 
     // Perform the reconnection
     performReconnection(requesterId, socket.id);
-    delete reconnectRequests[socket.id];
-    delete reconnectRequests[requesterId];
+    reconnectRequests.delete(socket.id);
+    reconnectRequests.delete(requesterId);
   });
 
   /* ---- DECLINE RECONNECTION REQUEST ---- */
   socket.on('decline-reconnect', ({ requesterId }) => {
-    const request = reconnectRequests[socket.id];
+    const request = reconnectRequests.get(socket.id);
     
     if (request && request.requesterId === requesterId) {
-      delete reconnectRequests[socket.id];
+      reconnectRequests.delete(socket.id);
       io.to(requesterId).emit('reconnect-declined', {
-        partnerName: users[socket.id]?.name || 'Stranger'
+        partnerName: getPublicName(users.get(socket.id))
       });
     }
   });
@@ -898,10 +1022,10 @@ io.on('connection', socket => {
   /* ---- CHECK RECONNECTION AVAILABILITY ---- */
   socket.on('check-reconnection', () => {
     console.log(`Check reconnection for ${socket.id}`);
-    const recentPartner = recentPartners[socket.id];
+    const recentPartner = recentPartners.get(socket.id);
     
     if (recentPartner && Date.now() - recentPartner.timestamp <= 300000) {
-      const partner = users[recentPartner.partnerId];
+      const partner = users.get(recentPartner.partnerId);
       console.log(`Recent partner found: ${recentPartner.partnerId}, online: ${!!partner}, available: ${partner && !partner.partner}`);
       
       if (partner && !partner.partner) {
@@ -919,7 +1043,7 @@ io.on('connection', socket => {
   });
 
   /* ---- FIND PARTNER (OPTIMIZED) ---- */
-  socket.on('find-partner', ({ country, gender, name, userIdentity }) => {
+  socket.on('find-partner', async ({ country, gender, name, userIdentity }) => {
     // PERFORMANCE: Early validation and rate limiting
     if (isSkipAbusing(socket.id)) {
       socket.emit('status-error', 'Please wait before searching again.');
@@ -927,24 +1051,27 @@ io.on('connection', socket => {
     }
 
     const user = users.get(socket.id);
-    if (!user || bannedUsers.has(socket.id)) return;
+    if (!user) return;
 
     // PERFORMANCE: Batch update user properties
     Object.assign(user, {
-      country: country || 'any',
-      gender: gender || 'any',
-      name: (name || '').slice(0, 30),
+      country: sanitizeText(country, 5) || 'any',
+      gender: sanitizeText(gender, 20) || 'any',
+      name: sanitizeText(name, 30),
       lastActiveAt: Date.now(),
       timeZone: new Date().getTimezoneOffset()
     });
     
     // Set identity fields
     if (userIdentity) {
+      const deviceId = sanitizeText(userIdentity.deviceId, 120) || `device_${socket.id}`;
+      const suppliedUserId = sanitizeText(userIdentity.userId, 160);
       Object.assign(user, {
-        username: userIdentity.username || user.name || 'Anonymous',
-        email: userIdentity.email || null,
-        userId: userIdentity.userId || `guest_${socket.id}`,
-        loginType: userIdentity.type || 'session',
+        username: sanitizeText(userIdentity.username || user.name || 'Anonymous', 30),
+        email: sanitizeText(userIdentity.email, 200) || null,
+        userId: suppliedUserId || `guest_${deviceId}`,
+        deviceId,
+        loginType: sanitizeText(userIdentity.type, 20) || 'session',
         isGuest: userIdentity.isGuest !== false
       });
     } else {
@@ -952,15 +1079,23 @@ io.on('connection', socket => {
       Object.assign(user, {
         username: user.name || 'Anonymous',
         userId: `guest_${socket.id}`,
+        deviceId: `device_${socket.id}`,
         loginType: 'session',
         isGuest: true
       });
     }
 
-    const match = findMatchFor(socket.id, country, gender, user.timeZone);
+    const activeBan = await store.getBan(user.userId);
+    if (activeBan) {
+      socket.emit('user-banned', formatBanPayload(activeBan));
+      socket.emit('status-error', 'This identity is temporarily restricted.');
+      return;
+    }
+
+    const match = findMatchFor(socket.id, user.country, user.gender, user.timeZone);
 
     if (!match) {
-      addToQueue(socket.id, country, gender, user.timeZone);
+      addToQueue(socket.id, user.country, user.gender, user.timeZone);
       socket.emit('waiting-for-partner');
       return;
     }
@@ -972,7 +1107,7 @@ io.on('connection', socket => {
     
     if (!matchSocket || !matchUser) {
       // Match user disconnected, try again
-      addToQueue(socket.id, country, gender, user.timeZone);
+      addToQueue(socket.id, user.country, user.gender, user.timeZone);
       socket.emit('waiting-for-partner');
       return;
     }
@@ -1000,11 +1135,13 @@ io.on('connection', socket => {
       userA: {
         socketId: socket.id,
         name: user.username || user.name || 'Stranger',
+        userId: user.userId,
         connected: true
       },
       userB: {
         socketId: match,
         name: matchUser.username || matchUser.name || 'Stranger',
+        userId: matchUser.userId,
         connected: true
       },
       roomId,
@@ -1084,7 +1221,8 @@ io.on('connection', socket => {
 ========================= */
 
 // PERFORMANCE: Optimized idle timeout with batch processing
-setInterval(() => {
+{
+  const handle = setInterval(() => {
   const now = Date.now();
   const idleUsers = [];
 
@@ -1099,10 +1237,14 @@ setInterval(() => {
     console.log('Idle timeout:', id);
     cleanUser(id);
   }
-}, 10_000);
+  }, 10_000);
+  handle.unref();
+  intervalHandles.push(handle);
+}
 
 // PERFORMANCE: Optimized cleanup with better intervals
-setInterval(() => {
+{
+  const handle = setInterval(() => {
   const now = Date.now();
   
   // Clean expired reconnection sessions
@@ -1126,10 +1268,14 @@ setInterval(() => {
       reconnectRequests.delete(socketId);
     }
   }
-}, 30_000);
+  }, 30_000);
+  handle.unref();
+  intervalHandles.push(handle);
+}
 
 // PERFORMANCE: Memory and connection monitoring
-setInterval(() => {
+{
+  const handle = setInterval(() => {
   const memUsage = process.memoryUsage();
   const memMB = Math.round(memUsage.heapUsed / 1024 / 1024);
   
@@ -1144,33 +1290,55 @@ setInterval(() => {
   if (activeConnections > MAX_CONNECTIONS * 0.9) {
     console.warn(`⚠️ Approaching connection limit: ${activeConnections}/${MAX_CONNECTIONS}`);
   }
-}, 60_000);
+  }, 60_000);
+  handle.unref();
+  intervalHandles.push(handle);
+}
 
 /* =========================
    START SERVER (OPTIMIZED)
 ========================= */
 
-const PORT = process.env.PORT || 4000;
-const NODE_ENV = process.env.NODE_ENV || 'development';
+function start(listenPort = PORT) {
+  // PERFORMANCE: Configure server for production
+  if (NODE_ENV === 'production') {
+    // Enable keep-alive
+    server.keepAliveTimeout = 65000;
+    server.headersTimeout = 66000;
 
-// PERFORMANCE: Configure server for production
-if (NODE_ENV === 'production') {
-  // Enable keep-alive
-  server.keepAliveTimeout = 65000;
-  server.headersTimeout = 66000;
-  
-  // Optimize for production
-  app.set('trust proxy', 1);
+    // Optimize for production
+    app.set('trust proxy', 1);
+  }
+
+  return new Promise((resolve) => {
+    server.listen(listenPort, () => {
+      const address = server.address();
+      const actualPort = typeof address === 'object' && address ? address.port : listenPort;
+      console.log(`🚀 Strango Server running at http://localhost:${actualPort}`);
+      console.log(`📊 Environment: ${NODE_ENV}`);
+      console.log(`👥 Max connections: ${MAX_CONNECTIONS}`);
+      console.log(`🔧 Node.js version: ${process.version}`);
+
+      const memUsage = process.memoryUsage();
+      console.log(`💾 Initial memory: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`);
+      resolve({ port: actualPort });
+    });
+  });
 }
 
-server.listen(PORT, () => {
-  console.log(`🚀 Strango Server running at http://localhost:${PORT}`);
-  console.log(`📊 Environment: ${NODE_ENV}`);
-  console.log(`👥 Max connections: ${MAX_CONNECTIONS}`);
-  console.log(`🔧 Node.js version: ${process.version}`);
-  
-  // Log system resources
-  const memUsage = process.memoryUsage();
-  console.log(`💾 Initial memory: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`);
-});
+function stop() {
+  for (const handle of intervalHandles) clearInterval(handle);
+  intervalHandles.length = 0;
+  try { io.close(); } catch {}
+  return new Promise((resolve) => server.close(resolve));
+}
+
+module.exports = { app, server, io, start, stop };
+
+if (require.main === module) {
+  start().catch(err => {
+    console.error('Failed to start server:', err);
+    process.exitCode = 1;
+  });
+}
 
